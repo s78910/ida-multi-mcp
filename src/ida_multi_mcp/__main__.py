@@ -677,7 +677,14 @@ def install_mcp_servers(uninstall=False, quiet=False):
         is_toml = config_file.endswith(".toml")
 
         if name == "Factory Droid" and not uninstall:
-            os.makedirs(config_dir, exist_ok=True)
+            try:
+                os.makedirs(config_dir, exist_ok=True)
+            except OSError as exc:
+                if not quiet:
+                    print(
+                        f"Skipping {name}\n  Config: {config_path} (cannot create dir: {exc.__class__.__name__})"
+                    )
+                continue
 
         if not os.path.exists(config_dir):
             action = "uninstall" if uninstall else "installation"
@@ -696,64 +703,93 @@ def install_mcp_servers(uninstall=False, quiet=False):
         if not os.path.exists(config_path):
             config = {}
         else:
-            with open(
-                config_path,
-                "rb" if is_toml else "r",
-                encoding=None if is_toml else "utf-8",
-            ) as f:
-                if is_toml:
-                    data = f.read()
-                    if len(data) == 0:
-                        config = {}
-                    else:
-                        try:
-                            config = tomllib.loads(data.decode("utf-8"))
-                        except Exception:
-                            if not quiet:
-                                print(
-                                    f"Skipping {name}\n  Config: {config_path} (invalid TOML)"
-                                )
-                            continue
-                else:
-                    data = f.read().strip()
-                    if len(data) == 0:
-                        config = {}
-                    else:
-                        try:
-                            config = json.loads(data)
-                        except json.decoder.JSONDecodeError:
-                            if not quiet:
-                                print(
-                                    f"Skipping {name}\n  Config: {config_path} (invalid JSON)"
-                                )
-                            continue
+            # The path may be unreadable (permissions), a directory, or held
+            # open by another process — skip this client rather than aborting
+            # the whole install.
+            try:
+                with open(
+                    config_path,
+                    "rb" if is_toml else "r",
+                    encoding=None if is_toml else "utf-8",
+                ) as f:
+                    raw = f.read()
+            except OSError as exc:
+                if not quiet:
+                    print(
+                        f"Skipping {name}\n  Config: {config_path} (cannot read: {exc.__class__.__name__})"
+                    )
+                continue
 
-        # Handle TOML vs JSON structure
+            if is_toml:
+                if len(raw) == 0:
+                    config = {}
+                else:
+                    try:
+                        config = tomllib.loads(raw.decode("utf-8"))
+                    except Exception:
+                        if not quiet:
+                            print(
+                                f"Skipping {name}\n  Config: {config_path} (invalid TOML)"
+                            )
+                        continue
+            else:
+                data = raw.strip()
+                if len(data) == 0:
+                    config = {}
+                else:
+                    try:
+                        config = json.loads(data)
+                    except json.decoder.JSONDecodeError:
+                        if not quiet:
+                            print(
+                                f"Skipping {name}\n  Config: {config_path} (invalid JSON)"
+                            )
+                        continue
+
+        # A config that parses to a non-dict (e.g. a top-level JSON array)
+        # cannot hold a server map — skip rather than crashing on indexing.
+        if not isinstance(config, dict):
+            if not quiet:
+                print(
+                    f"Skipping {name}\n  Config: {config_path} (unexpected structure: root is {type(config).__name__})"
+                )
+            continue
+
+        # Handle TOML vs JSON structure. setdefault creates the map when
+        # missing; the isinstance check below catches a key that exists but
+        # holds an unexpected (non-dict) value, so we never index into it.
         if is_toml:
-            if "mcp_servers" not in config:
-                config["mcp_servers"] = {}
-            mcp_servers = config["mcp_servers"]
+            mcp_servers = config.setdefault("mcp_servers", {})
         else:
             # Check if this client uses a special JSON structure
             if name in special_json_structures:
                 top_key, nested_key = special_json_structures[name]
                 if top_key is None:
                     # servers map at the top level under nested_key
-                    if nested_key not in config:
-                        config[nested_key] = {}
-                    mcp_servers = config[nested_key]
+                    mcp_servers = config.setdefault(nested_key, {})
                 else:
                     # nested structure (e.g., VS Code uses mcp.servers)
-                    if top_key not in config:
-                        config[top_key] = {}
-                    if nested_key not in config[top_key]:
-                        config[top_key][nested_key] = {}
-                    mcp_servers = config[top_key][nested_key]
+                    parent = config.setdefault(top_key, {})
+                    if not isinstance(parent, dict):
+                        if not quiet:
+                            print(
+                                f"Skipping {name}\n  Config: {config_path} "
+                                f"(unexpected structure: '{top_key}' is {type(parent).__name__})"
+                            )
+                        continue
+                    mcp_servers = parent.setdefault(nested_key, {})
             else:
                 # Default: mcpServers at top level
-                if "mcpServers" not in config:
-                    config["mcpServers"] = {}
-                mcp_servers = config["mcpServers"]
+                mcp_servers = config.setdefault("mcpServers", {})
+
+        # The server map must be a dict to hold our entry.
+        if not isinstance(mcp_servers, dict):
+            if not quiet:
+                print(
+                    f"Skipping {name}\n  Config: {config_path} "
+                    f"(unexpected structure: server map is {type(mcp_servers).__name__})"
+                )
+            continue
 
         # Migrate old "ida-pro-mcp" entry to "ida-multi-mcp"
         migrated = False
@@ -794,9 +830,17 @@ def install_mcp_servers(uninstall=False, quiet=False):
 
         # Atomic write: temp file + replace (with Windows-friendly fallback)
         suffix = ".toml" if is_toml else ".json"
-        fd, temp_path = tempfile.mkstemp(
-            dir=config_dir, prefix=".tmp_", suffix=suffix, text=True
-        )
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                dir=config_dir, prefix=".tmp_", suffix=suffix, text=True
+            )
+        except OSError as exc:
+            if not quiet:
+                print(
+                    f"Skipping {name}\n  Config: {config_path} (cannot create temp file: {exc.__class__.__name__})"
+                )
+            continue
+
         try:
             with os.fdopen(
                 fd, "wb" if is_toml else "w", encoding=None if is_toml else "utf-8"
@@ -815,6 +859,10 @@ def install_mcp_servers(uninstall=False, quiet=False):
                     json.dump(config, f, indent=2)
 
             if not _replace_or_overwrite_file(temp_path, config_path):
+                try:
+                    os.unlink(temp_path)  # don't leave a .tmp_ orphan behind
+                except OSError:
+                    pass
                 if not quiet:
                     action = "uninstall" if uninstall else "installation"
                     print(
@@ -822,12 +870,17 @@ def install_mcp_servers(uninstall=False, quiet=False):
                         f"  Config: {config_path} (permission denied; close the app using it and retry)"
                     )
                 continue
-        except Exception:
+        except Exception as exc:
+            # Don't let one client's write failure abort the rest of the run.
             try:
                 os.unlink(temp_path)
-            except Exception:
+            except OSError:
                 pass
-            raise
+            if not quiet:
+                print(
+                    f"Skipping {name}\n  Config: {config_path} (write failed: {exc.__class__.__name__})"
+                )
+            continue
 
         if not quiet:
             action = "Uninstalled" if uninstall else "Installed"
