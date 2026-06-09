@@ -54,25 +54,26 @@ def _get_funcs_cache() -> list["Function"]:
 
 
 def _get_funcs_query_cache() -> list[dict]:
-    """Cached function metadata for func_query (adds size_int + has_type).
+    """Lightweight func_query rows derived from the warm functions cache.
 
-    Kept separate from _funcs_cache because it carries extra fields used
-    only for filtering/sorting. Invalidated together with _funcs_cache.
+    Reuses _funcs_cache (addr/name/size) and only adds size_int, so it does
+    NO per-function IDA calls and stays fast even on 100K+ function binaries.
+    has_type is intentionally NOT precomputed here (a get_tinfo() per function
+    would re-introduce a full scan that times out); func_query computes it
+    lazily only for the rows it actually returns or filters on. Invalidated
+    together with _funcs_cache.
     """
     global _funcs_query_cache
     if _funcs_query_cache is None:
         rows: list[dict] = []
-        tif = ida_typeinf.tinfo_t()
-        for addr in idautils.Functions():
-            fn = idaapi.get_func(addr)
-            if not fn:
-                continue
-            size_int = fn.end_ea - fn.start_ea
-            fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-            has_type = bool(ida_nalt.get_tinfo(tif, fn.start_ea))
+        for fn in _get_funcs_cache():
+            try:
+                size_int = int(fn["size"], 16)
+            except (KeyError, ValueError, TypeError):
+                size_int = 0
             rows.append({
-                "addr": hex(fn.start_ea), "name": fn_name,
-                "size": hex(size_int), "size_int": size_int, "has_type": has_type,
+                "addr": fn["addr"], "name": fn["name"],
+                "size": fn["size"], "size_int": size_int,
             })
         _funcs_query_cache = rows
     return _funcs_query_cache
@@ -536,6 +537,7 @@ def _collect_imports() -> list[dict]:
 
 @tool
 @idasync
+@tool_timeout(60.0)
 def func_query(
     queries: Annotated[list[dict] | dict,
         "Function query: filter, name_regex, min_size, max_size, has_type, sort_by, descending, offset, count"],
@@ -547,6 +549,16 @@ def func_query(
 
     # Shared, cached metadata — must not be mutated in place below.
     all_functions = _get_funcs_query_cache()
+
+    # has_type is resolved lazily: a get_tinfo() per function over the whole
+    # binary would time out on 100K+ function targets. Reuse one tinfo_t.
+    _tif = ida_typeinf.tinfo_t()
+
+    def _has_type(row: dict) -> bool:
+        try:
+            return bool(ida_nalt.get_tinfo(_tif, int(row["addr"], 16)))
+        except (ValueError, TypeError):
+            return False
 
     results = []
     for query in queries:
@@ -577,8 +589,10 @@ def func_query(
         if max_size is not None:
             filtered = [f for f in filtered if f["size_int"] <= int(max_size)]
 
+        # has_type filter: compute only for the already name/size-narrowed set.
         if "has_type" in query:
-            filtered = [f for f in filtered if f["has_type"] is bool(query["has_type"])]
+            want = bool(query["has_type"])
+            filtered = [f for f in filtered if _has_type(f) is want]
 
         # Copy before sorting in place when no filter narrowed the shared cache.
         if filtered is all_functions:
@@ -592,7 +606,12 @@ def func_query(
             filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
 
         page = paginate(filtered, offset, count)
-        page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+        # Resolve has_type only for the returned page (≤ count rows).
+        page["data"] = [
+            {**{k: v for k, v in item.items() if k != "size_int"},
+             "has_type": _has_type(item)}
+            for item in page["data"]
+        ]
         results.append(page)
 
     return results
