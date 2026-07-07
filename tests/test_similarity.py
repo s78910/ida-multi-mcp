@@ -1,0 +1,301 @@
+"""End-to-end tests for the server-side similarity pipeline using a mock router.
+
+Exercises index_functions -> similar_functions / compare_functions / index_status
+WITHOUT a live IDA instance: a MockRouter serves synthetic func_features and
+binary_fingerprint responses in the exact shape the real router returns.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC_ROOT))
+
+from ida_multi_mcp.tools import sim_score, similarity  # noqa: E402
+
+
+# --- synthetic feature corpus -------------------------------------------------
+
+# Distinct instruction-token streams (>= K tokens so MinHash is non-empty).
+T_ENC = ["mov.rr", "xor.rr", "add.rm", "cmp.ri", "jne.c", "mov.mr",
+         "call.c", "test.rr", "je.c", "inc.r", "mov.rm", "ret."]
+T_PARSE = ["push.r", "mov.rr", "call.c", "test.rr", "je.c", "lea.rd",
+           "call.c", "mov.rm", "add.ri", "jmp.c", "pop.r", "ret."]
+T_SUM = ["xor.rr", "test.rr", "jle.c", "add.rm", "add.ri", "cmp.rr",
+         "jne.c", "mov.rr", "ret.", "nop.", "lea.rd", "mov.rm"]
+T_MISC = ["sub.ri", "mov.rm", "call.c", "mov.mr", "call.c", "test.rr",
+          "jne.c", "mov.ri", "add.rr", "ret.", "push.r", "pop.r"]
+T_OTHER = ["fld.m", "fmul.m", "fstp.m", "mov.rm", "shr.ri", "and.ri",
+           "or.rr", "ret.", "jmp.c", "cmp.ri", "sete.r", "movzx.rr"]
+
+
+def _feat(addr, name, tokens, apis, strings, consts, cfg, is_named, pseudo=None):
+    f = {
+        "addr": addr,
+        "name": name,
+        "is_named": is_named,
+        "size": cfg.get("_size", 100),
+        "cfg": {k: v for k, v in cfg.items() if not k.startswith("_")},
+        "minhash": sim_score.compute_minhash(tokens),
+        "apis": sorted(set(apis)),
+        "strings": sorted(set(strings)),
+        "consts": sorted(set(consts)),
+    }
+    if is_named:
+        f["pseudo_tokens"] = pseudo or []
+    return f
+
+
+_CFG_A = {"bb_count": 6, "edge_count": 8, "complexity": 4, "loops": 1,
+          "callee_count": 3, "caller_count": 2, "out_deg_seq": [2, 2, 1, 1, 0, 0], "_size": 213}
+_CFG_B = {"bb_count": 3, "edge_count": 3, "complexity": 2, "loops": 0,
+          "callee_count": 2, "caller_count": 5, "out_deg_seq": [1, 1, 0], "_size": 80}
+_CFG_C = {"bb_count": 4, "edge_count": 5, "complexity": 3, "loops": 1,
+          "callee_count": 0, "caller_count": 1, "out_deg_seq": [2, 1, 0, 0], "_size": 60}
+
+
+def _corpus():
+    """instance_id -> list[FunctionFeature]."""
+    aaaa = [
+        _feat("0x1001", "encrypt_a", T_ENC, ["CreateFileW", "WriteFile", "CryptEncrypt"],
+              ["%s.enc"], ["0xdeadbeef"], _CFG_A, True, ["encrypt", "key", "buf"]),
+        # near-duplicate of encrypt_a (Type-1): identical tokens + anchors + cfg
+        _feat("0x1002", "encrypt_b", T_ENC, ["CreateFileW", "WriteFile", "CryptEncrypt"],
+              ["%s.enc"], ["0xdeadbeef"], _CFG_A, True, ["encrypt", "key", "buf"]),
+        _feat("0x1003", "parse_x", T_PARSE, ["strtol", "strchr"], [], [], _CFG_B, True, ["parse", "line"]),
+        _feat("0x1004", "sub_1004", T_SUM, [], [], [], _CFG_C, False),
+        _feat("0x1005", "misc_z", T_MISC, ["malloc", "free"], ["hello"], ["0x2a"], _CFG_B, True, ["misc"]),
+        # tiny thunk: no shingles -> empty minhash, only an anchor
+        _feat("0x1006", "sub_1006", ["jmp.c"], ["memcpy"], [], [], _CFG_C, False),
+    ]
+    bbbb = [
+        # cross-instance twin of encrypt_a
+        _feat("0x2001", "encrypt_twin", T_ENC, ["CreateFileW", "WriteFile", "CryptEncrypt"],
+              ["%s.enc"], ["0xdeadbeef"], _CFG_A, True, ["encrypt", "key", "buf"]),
+        _feat("0x2002", "unrelated", T_OTHER, ["printf"], ["world"], ["0x99"], _CFG_B, True, ["unrelated"]),
+    ]
+    return {"aaaa": aaaa, "bbbb": bbbb}
+
+
+class MockRegistry:
+    def __init__(self, registry_path, corpus):
+        self.registry_path = registry_path
+        self._corpus = corpus
+
+    def list_instances(self):
+        return {iid: {"binary_name": f"{iid}.exe", "binary_path": f"C:/x/{iid}.exe",
+                      "arch": "x86_64"} for iid in self._corpus}
+
+    def get_instance(self, iid):
+        insts = self.list_instances()
+        return insts.get(iid)
+
+
+class MockRouter:
+    """Serves func_features / binary_fingerprint in the real router's result shape."""
+
+    def __init__(self, corpus):
+        self._corpus = corpus
+
+    def route_request(self, method, params):
+        name = params.get("name")
+        args = params.get("arguments", {})
+        iid = args.get("instance_id")
+        feats = self._corpus.get(iid)
+        if feats is None:
+            return {"error": f"no instance {iid}"}
+        if name == "binary_fingerprint":
+            payload = {"sha256": f"sha-{iid}", "md5": None,
+                       "function_count": len(feats), "arch": "x86_64"}
+        elif name == "func_features":
+            addrs = args.get("addrs", "*")
+            if addrs == "*":
+                offset = int(args.get("offset", 0))
+                count = int(args.get("count", 500))
+                page = feats[offset:offset + count]
+                nxt = offset + len(page)
+                cursor = {"done": True} if nxt >= len(feats) else {"next": nxt}
+                payload = {"functions": page, "total": len(feats), "cursor": cursor}
+            else:
+                match = [f for f in feats if f["addr"] == str(addrs) or f["name"] == str(addrs)]
+                payload = {"functions": match[:1], "total": len(match),
+                           "cursor": {"done": True}}
+        else:
+            return {"error": f"unknown tool {name}"}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload}
+
+
+class SimilarityPipelineTest(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        registry_path = os.path.join(self._td.name, "instances.json")
+        corpus = _corpus()
+        similarity.set_registry(MockRegistry(registry_path, corpus))
+        similarity.set_router(MockRouter(corpus))
+        # reset module state between tests
+        similarity._jobs.clear()
+        similarity._loaded.clear()
+
+    def tearDown(self):
+        similarity._jobs.clear()
+        similarity._loaded.clear()
+        self._td.cleanup()
+
+    def _index(self, iid):
+        return similarity.index_functions({"instance_id": iid, "background": False})
+
+    def test_index_build_and_status(self):
+        res = self._index("aaaa")
+        self.assertEqual(res["status"], "ready")
+        self.assertEqual(res["function_count"], 6)
+        st = similarity.index_status({"instance_id": "aaaa"})
+        self.assertTrue(st["indexed"])
+        self.assertEqual(st["function_count"], 6)
+        # second call is a cached no-op
+        again = self._index("aaaa")
+        self.assertTrue(again.get("cached"))
+
+    def test_similar_finds_duplicate_top1(self):
+        self._index("aaaa")
+        out = similarity.similar_functions({"instance_id": "aaaa", "func": "0x1001", "top_k": 5})
+        self.assertTrue(out["results"], "expected at least one match")
+        top = out["results"][0]
+        self.assertEqual(top["addr"], "0x1002")           # encrypt_b is the twin
+        self.assertGreater(top["score"], 0.75)
+        self.assertEqual(top["confidence"], "high")
+        # query itself excluded
+        self.assertNotIn("0x1001", [r["addr"] for r in out["results"]])
+
+    def test_cross_instance_search(self):
+        self._index("aaaa")
+        self._index("bbbb")
+        out = similarity.similar_functions({
+            "instance_id": "aaaa", "func": "0x1001",
+            "scope": "instances", "instances": ["bbbb"], "top_k": 5,
+        })
+        addrs = [(r["instance_id"], r["addr"]) for r in out["results"]]
+        self.assertIn(("bbbb", "0x2001"), addrs)          # cross-binary twin found
+        self.assertGreater(out["results"][0]["score"], 0.75)
+
+    def test_compare_high_and_low(self):
+        self._index("aaaa")
+        hi = similarity.compare_functions({
+            "a": {"instance_id": "aaaa", "func": "0x1001"},
+            "b": {"instance_id": "aaaa", "func": "0x1002"},
+        })
+        lo = similarity.compare_functions({
+            "a": {"instance_id": "aaaa", "func": "0x1001"},
+            "b": {"instance_id": "aaaa", "func": "0x1003"},
+        })
+        self.assertGreater(hi["score"], 0.75)
+        self.assertGreater(hi["score"], lo["score"] + 0.3)
+
+    def test_min_score_filters(self):
+        self._index("aaaa")
+        out = similarity.similar_functions({
+            "instance_id": "aaaa", "func": "0x1001", "min_score": 0.99, "top_k": 20})
+        # only the (near-)identical twin should survive a 0.99 threshold
+        for r in out["results"]:
+            self.assertGreaterEqual(r["score"], 0.99)
+
+    def test_not_indexed_hint(self):
+        # query instance indexed, gallery instance not
+        self._index("aaaa")
+        out = similarity.similar_functions({
+            "instance_id": "aaaa", "func": "0x1001",
+            "scope": "instances", "instances": ["bbbb"]})
+        self.assertIn("bbbb", out.get("not_indexed", []))
+        self.assertIn("hint", out)
+
+    def test_missing_func_errors(self):
+        self._index("aaaa")
+        out = similarity.similar_functions({"instance_id": "aaaa", "func": "0xBADADDR"})
+        self.assertIn("error", out)
+
+
+class _ErrRouter:
+    """Mirrors the REAL func_features behaviour the default MockRouter omits:
+    a per-function ``{"addr","error"}`` stub is mixed into the ``*`` page, and an
+    unresolvable single-function query returns such a stub (not an empty list).
+    """
+
+    def __init__(self, good):
+        self._good = good
+
+    def route_request(self, method, params):
+        name = params.get("name")
+        args = params.get("arguments", {})
+        if name == "binary_fingerprint":
+            payload = {"sha256": "sha-err", "md5": None,
+                       "function_count": len(self._good) + 1, "arch": "x86_64"}
+        elif name == "func_features":
+            addrs = args.get("addrs", "*")
+            if addrs == "*":
+                page = list(self._good) + [{"addr": "0x9099", "error": "No function found"}]
+                payload = {"functions": page, "total": len(page), "cursor": {"done": True}}
+            else:
+                m = [f for f in self._good
+                     if f["addr"] == str(addrs) or f.get("name") == str(addrs)]
+                payload = {
+                    "functions": m[:1] if m else [{"addr": str(addrs), "error": "No function found"}],
+                    "total": 1, "cursor": {"done": True},
+                }
+        else:
+            return {"error": f"unknown tool {name}"}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload}
+
+
+class SimilarityErrorRecordTest(unittest.TestCase):
+    """Regression: a single un-analyzable function must not sink the index, and
+    an unextractable query must return a clean error (not a leaked KeyError)."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        rp = os.path.join(self._td.name, "instances.json")
+        self._good = _corpus()["aaaa"][:2]  # two complete records
+        similarity.set_registry(MockRegistry(rp, {"err": self._good}))
+        similarity.set_router(_ErrRouter(self._good))
+        similarity._jobs.clear()
+        similarity._loaded.clear()
+
+    def tearDown(self):
+        similarity._jobs.clear()
+        similarity._loaded.clear()
+        self._td.cleanup()
+
+    def test_index_build_skips_error_records(self):
+        res = similarity.index_functions({"instance_id": "err", "background": False})
+        self.assertEqual(res["status"], "ready")
+        self.assertEqual(res["function_count"], 2)   # error stub excluded, no crash
+        self.assertEqual(res["skipped_count"], 1)
+
+    def test_index_gallery_excludes_error_records(self):
+        similarity.index_functions({"instance_id": "err", "background": False})
+        # a good function still finds its twin; the error stub is not in the gallery
+        out = similarity.similar_functions({"instance_id": "err", "func": "0x1001"})
+        addrs = [r["addr"] for r in out["results"]]
+        self.assertNotIn("0x9099", addrs)
+
+    def test_query_extraction_error_is_clean(self):
+        similarity.index_functions({"instance_id": "err", "background": False})
+        out = similarity.similar_functions({"instance_id": "err", "func": "0xBAD"})
+        self.assertIn("error", out)
+        self.assertNotIn("KeyError", out["error"])   # clean message, not an exception leak
+
+    def test_compare_extraction_error_is_clean(self):
+        out = similarity.compare_functions({
+            "a": {"instance_id": "err", "func": "0x1001"},
+            "b": {"instance_id": "err", "func": "0xBAD"},
+        })
+        self.assertIn("error", out)
+        self.assertNotIn("KeyError", out["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
