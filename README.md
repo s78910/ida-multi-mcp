@@ -288,6 +288,11 @@ Decompile the main function in malware.exe (k7m2)
 Decompile main in malware.exe (k7m2) and compare it with the entry point in dropper.dll (px3a)
 ```
 
+**Function similarity (patch diff, library ID, variant hunting):**
+```
+Index malware.exe (k7m2) and dropper.dll (px3a), then find the function in dropper.dll most similar to sub_140001000 in malware.exe
+```
+
 ## Management Tools
 
 The server provides built-in management tools:
@@ -315,6 +320,14 @@ List all managed headless idalib sessions.
 
 ### idalib_status(instance_id) *(IDA Pro only)*
 Health/readiness check for a specific idalib session.
+
+### Function Similarity (BCSD)
+Local, cross-instance binary code similarity — no cloud, no external service. Signals are name-independent (survive stripping): instruction-shingle MinHash, IDF-weighted imported-API / string / constant anchors, and CFG structure/shape, plus symbol-gated pseudocode tokens. An optional `[neural]` extra adds on-demand jTrans embeddings for anchor-less cross-compiler matches.
+
+- **`index_functions(instance_id, rebuild=False)`** — build/refresh the searchable index for a binary (content-hash keyed, persisted under `~/.ida-mcp/index/`, incremental, backgroundable).
+- **`index_status(instance_id)`** — index readiness, function count, staleness, and background progress.
+- **`similar_functions(instance_id, func, top_k=20, scope="binary"|"instances"|"all")`** — rank the most similar functions within the binary or across instances; returns a per-signal breakdown and confidence label.
+- **`compare_functions(a, b)`** — direct pairwise similarity between two functions (optionally across instances).
 
 ## Instance IDs Explained
 
