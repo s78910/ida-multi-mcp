@@ -15,7 +15,7 @@ from .registry import InstanceRegistry
 from .router import InstanceRouter
 from .health import cleanup_stale_instances, rediscover_instances
 from .idalib_manager import IdalibManager
-from .tools import management, idalib as idalib_tools
+from .tools import management, idalib as idalib_tools, similarity
 from .cache import get_cache, DEFAULT_MAX_OUTPUT_CHARS
 
 # Static IDA tool schemas (loaded once at import time)
@@ -121,6 +121,8 @@ class IdaMultiMcpServer:
         management.set_refresh_callback(self._refresh_tools)
         management.set_router(self.router)
         idalib_tools.set_manager(self.idalib_manager)
+        similarity.set_registry(self.registry)
+        similarity.set_router(self.router)
 
         # Register handlers
         self._register_handlers()
@@ -237,6 +239,15 @@ class IdaMultiMcpServer:
                     "content": [{"type": "text", "text": _json_text(result)}],
                     "structuredContent": result,
                     "isError": "error" in result
+                }
+
+            # Similarity tools (local, cross-instance capable)
+            elif name in similarity.TOOL_NAMES:
+                result = similarity.dispatch(name, arguments)
+                return {
+                    "content": [{"type": "text", "text": _json_text(result)}],
+                    "structuredContent": result,
+                    "isError": "error" in result,
                 }
 
             # idalib management tools (local)
@@ -655,6 +666,10 @@ class IdaMultiMcpServer:
                 "required": ["output_dir", "instance_id"]
             }
         }
+
+        # Register similarity tool schemas (always available; extraction is IDA-side)
+        for schema in similarity.SIMILARITY_TOOL_SCHEMAS:
+            self._tool_cache[schema["name"]] = schema.copy()
 
         # Register idalib management tool schemas (only if IDA Pro with idalib is available)
         from .idalib_manager import is_idalib_available

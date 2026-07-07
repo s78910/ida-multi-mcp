@@ -52,6 +52,7 @@ MCP Client (Claude, Cursor, etc.)
 - **Dynamic tool discovery** — All 80+ IDA tools available automatically
 - **1-call binary triage** — `survey_binary` returns metadata, segments, top strings/functions, imports, and call graph in one call
 - **Cross-binary analysis** — Target specific instances via `instance_id` parameter
+- **Function-similarity search** — `similar_functions` / `compare_functions` rank BCSD matches (instruction-shingle MinHash + API/string/constant anchors + CFG/shape) within a binary or across instances. Optional on-demand **neural recall** (jTrans embeddings) recovers anchor-less cross-compiler twins that lexical/structural signals miss — enable with `pip install ida-multi-mcp[neural]` + `IDA_MCP_SIM_NEURAL=1` (model auto-downloads to `~/.ida-mcp/models/`)
 - **Smart instance tracking** — 4-character IDs (k7m2, px3a, etc.) with automatic binary-change detection
 - **IDA 8.3–9.3 compatible** — Built-in version compatibility shims (`compat.py`)
 - **File-based registry** — Tracks all active instances (GUI and headless)
