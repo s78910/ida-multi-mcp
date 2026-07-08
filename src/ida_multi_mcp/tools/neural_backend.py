@@ -75,6 +75,15 @@ def resolve_paths(download: bool = True) -> tuple[str, str]:
     return str(model_dir), tok
 
 
+def _select_device() -> str:
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 @functools.lru_cache(maxsize=2)
 def _load(model_id: str, tokenizer_id: str):
     import torch
@@ -92,7 +101,7 @@ def _load(model_id: str, tokenizer_id: str):
     tok = AutoTokenizer.from_pretrained(tokenizer_id)
     model = BinBertModel.from_pretrained(
         model_id, add_pooling_layer=False, ignore_mismatched_sizes=True)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = _select_device()
     model.to(dev).eval()
     return tok, model, dev
 
@@ -109,17 +118,21 @@ class JTransBackend:
         self.max_len = max_len
 
     def embed_batch(self, token_lists: list[list[str]]) -> list[list[float]]:
-        """token_lists -> unit-normalized [CLS] vectors (list[list[float]])."""
+        """token_lists -> unit-normalized [CLS] vectors (list[list[float]]).
+
+        One padded-batch tokenizer call + one forward pass per invocation
+        (not per item)."""
+        if not token_lists:
+            return []
         import torch
         tok, model, dev = _load(self.model_id, self.tokenizer_id)
-        vecs: list[list[float]] = []
+        texts = [" ".join(toks) if toks else "" for toks in token_lists]
         with torch.no_grad():
-            for toks in token_lists:
-                enc = tok(" ".join(toks) if toks else "", return_tensors="pt",
-                          truncation=True, max_length=self.max_len)
-                enc = {k: v.to(dev) for k, v in enc.items()}
-                v = model(**enc).last_hidden_state[0, 0]              # [CLS]
-                vecs.append(torch.nn.functional.normalize(v, dim=0).cpu().tolist())
+            enc = tok(texts, return_tensors="pt", truncation=True,
+                      max_length=self.max_len, padding=True)
+            enc = {k: v.to(dev) for k, v in enc.items()}
+            cls = model(**enc).last_hidden_state[:, 0]          # [CLS] per row
+            vecs = torch.nn.functional.normalize(cls, dim=1).cpu().tolist()
         return vecs
 
     def unk_rate(self, token_lists: list[list[str]]) -> float:
